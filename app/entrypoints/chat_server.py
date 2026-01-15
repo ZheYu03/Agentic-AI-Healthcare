@@ -6,6 +6,7 @@ import asyncio
 from typing import Any, Dict, List, Optional, AsyncGenerator
 
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
@@ -28,6 +29,36 @@ from app.utils.sse_utils import (
 )
 
 app = FastAPI(title="LangGraph Healthcare Chat", version="0.1.0")
+
+# Add CORS middleware for frontend communication
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with specific frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for deployment platforms."""
+    return {"status": "healthy", "service": "agentic-ai-healthcare"}
+
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "service": "Agentic AI Healthcare API",
+        "version": "0.1.0",
+        "endpoints": {
+            "health": "/health",
+            "chat": "/chat",
+            "chat_stream": "/chat/stream"
+        }
+    }
+
 
 
 class SessionStore:

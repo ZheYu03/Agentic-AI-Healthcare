@@ -1,0 +1,46 @@
+services:
+  - type: web
+    name: agentic-ai-healthcare-backend
+    runtime: docker
+    repo: https://github.com/ZheYu03/Agentic-AI-Healthcare.git
+    branch: main
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    plan: free
+    envVars:
+      - key: LANGCHAIN_TRACING_V2
+        value: true
+      - key: LANGCHAIN_ENDPOINT
+        value: https://api.smith.langchain.com
+      - key: LANGCHAIN_API_KEY
+        sync: false
+      - key: LANGCHAIN_PROJECT
+        value: AI-HEALTHCARE-AGENT
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_ENVIRONMENT
+        value: us-east-1-aws
+      - key: PINECONE_INDEX_NAME
+        value: medquad-gemini
+      - key: PINECONE_INDEX_HOST
+        sync: false
+      - key: VECTOR_STORE_MODE
+        value: cloud
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3-flash-preview
+      - key: LLM_PROVIDER
+        value: gemini
+      - key: OPENAI_API_KEY
+        sync: false
+    healthCheckPath: /health
+    autoDeploy: true

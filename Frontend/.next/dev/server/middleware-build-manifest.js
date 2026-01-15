@@ -3,9 +3,22 @@ globalThis.__BUILD_MANIFEST = {
     "/_app": []
   },
   "devFiles": [],
-  "polyfillFiles": [],
+  "polyfillFiles": [
+    "static/chunks/998ce_next_dist_build_polyfills_polyfill-nomodule.js"
+  ],
   "lowPriorityFiles": [],
-  "rootMainFiles": []
+  "rootMainFiles": [
+    "static/chunks/[turbopack]_browser_dev_hmr-client_hmr-client_ts_6d45bc6b._.js",
+    "static/chunks/998ce_next_dist_compiled_react-dom_b67b215e._.js",
+    "static/chunks/998ce_next_dist_compiled_react-server-dom-turbopack_1fc07f81._.js",
+    "static/chunks/998ce_next_dist_compiled_next-devtools_index_74f649ce.js",
+    "static/chunks/998ce_next_dist_compiled_c4d6cc1d._.js",
+    "static/chunks/998ce_next_dist_client_5b1435a9._.js",
+    "static/chunks/998ce_next_dist_67eb601c._.js",
+    "static/chunks/998ce_@swc_helpers_cjs_7f32c8ec._.js",
+    "static/chunks/Agentic AI Healthcare_Frontend_a0ff3932._.js",
+    "static/chunks/turbopack-Agentic AI Healthcare_Frontend_9ee41f51._.js"
+  ]
 };
 globalThis.__BUILD_MANIFEST.lowPriorityFiles = [
 "/static/" + process.env.__NEXT_BUILD_ID + "/_buildManifest.js",
