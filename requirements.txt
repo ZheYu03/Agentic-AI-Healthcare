@@ -1,0 +1,13 @@
+langgraph
+langchain
+langchain-community
+langchain-google-genai
+langchain-pinecone
+langsmith
+pydantic
+pydantic-settings
+python-dotenv
+psycopg2-binary
+supabase
+fastapi
+uvicorn

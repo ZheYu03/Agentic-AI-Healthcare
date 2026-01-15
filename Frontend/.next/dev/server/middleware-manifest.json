@@ -1,0 +1,36 @@
+{
+  "version": 3,
+  "middleware": {
+    "/": {
+      "files": [
+        "server/edge/chunks/Agentic AI Healthcare_Frontend_47a035bd._.js",
+        "server/edge/chunks/998ce_@opentelemetry_api_build_esm_b6c9019e._.js",
+        "server/edge/chunks/998ce_@supabase_auth-js_dist_module_1973eb99._.js",
+        "server/edge/chunks/998ce_2eb3008f._.js",
+        "server/edge/chunks/[root-of-the-server]__1e694674._.js",
+        "server/edge/chunks/turbopack-Agentic AI Healthcare_Frontend_edge-wrapper_e19f4cb7.js"
+      ],
+      "name": "middleware",
+      "page": "/",
+      "matchers": [
+        {
+          "regexp": "^(?:\\/(_next\\/data\\/[^/]{1,}))?(?:\\/((?!_next\\/static|_next\\/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*))(\\\\.json)?[\\/#\\?]?$",
+          "originalSource": "/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)"
+        }
+      ],
+      "wasm": [],
+      "assets": [],
+      "env": {
+        "__NEXT_BUILD_ID": "development",
+        "NEXT_SERVER_ACTIONS_ENCRYPTION_KEY": "voXdRUM/tO/gfnB5URx+pELYD36T9j+rLvvcjECD9WA=",
+        "__NEXT_PREVIEW_MODE_ID": "659de66f7d625b332dc363d2c21eb2a4",
+        "__NEXT_PREVIEW_MODE_ENCRYPTION_KEY": "31e689df08a659f01ac1b6b64965984dac92be0e8367fbcd2b1c03ac48d74fdc",
+        "__NEXT_PREVIEW_MODE_SIGNING_KEY": "9615832cc1940113af3e1527ea324a4376363afe1854c1815b3cef98cd579956"
+      }
+    }
+  },
+  "sortedMiddleware": [
+    "/"
+  ],
+  "functions": {}
+}
