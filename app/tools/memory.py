@@ -9,12 +9,39 @@ Rules:
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+import re
 
 from langsmith import traceable
 
 from app.tools.supabase_tool import get_supabase_client
 
 TABLE_NAME = 'Patient Profile Memory'
+
+
+def _parse_datetime_robust(dt_string: str) -> datetime:
+    """
+    Robustly parse ISO format datetime strings with varying microsecond precision.
+    Normalizes microseconds to 6 digits before parsing to avoid fromisoformat() errors.
+    """
+    # Pattern to match ISO datetime with optional microseconds and timezone
+    pattern = r'^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d+))?((?:[+-]\d{2}:\d{2}|Z)?)$'
+    match = re.match(pattern, dt_string)
+    
+    if not match:
+        # Fallback to standard parsing if pattern doesn't match
+        return datetime.fromisoformat(dt_string)
+    
+    base_dt, microseconds, timezone_part = match.groups()
+    
+    # Normalize microseconds to 6 digits
+    if microseconds:
+        # Pad or truncate to 6 digits
+        microseconds = microseconds.ljust(6, '0')[:6]
+        normalized = f"{base_dt}.{microseconds}{timezone_part}"
+    else:
+        normalized = f"{base_dt}{timezone_part}"
+    
+    return datetime.fromisoformat(normalized)
 
 
 @traceable(
@@ -35,7 +62,7 @@ def read_long_term_memory(patient_id: str, memory_type: Optional[str] = None) ->
     rows = resp.data or []
 
     now = datetime.now(timezone.utc)
-    filtered = [r for r in rows if not r.get("expires_at") or datetime.fromisoformat(r["expires_at"]).replace(tzinfo=timezone.utc) > now]
+    filtered = [r for r in rows if not r.get("expires_at") or _parse_datetime_robust(r["expires_at"]).replace(tzinfo=timezone.utc) > now]
 
     grouped: Dict[str, List[Dict[str, Any]]] = {}
     for r in filtered:
