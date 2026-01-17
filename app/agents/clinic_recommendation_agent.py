@@ -516,6 +516,24 @@ def clinic_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
             )
         if not open_now:
             continue
+        # Validate website URL - filter out malformed Google redirect URLs
+        website = row.get("website", "")
+        if website:
+            # Filter out malformed URLs:
+            # - Must start with http:// or https://
+            # - Don't include Google redirect patterns (/aclk, /url?, etc.)
+            # - Must be reasonably short (< 200 chars for clean URLs)
+            website = website.strip()
+            is_valid = (
+                website.startswith(("http://", "https://")) and
+                "/aclk" not in website and
+                "/url?" not in website and
+                "?sa=" not in website and
+                len(website) < 200
+            )
+            if not is_valid:
+                website = ""  # Clear invalid URLs
+        
         filtered.append(
             {
                 "id": row.get("id"),
@@ -529,7 +547,7 @@ def clinic_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
                 "state": row.get("state"),
                 "facility_type": row.get("facility_type"),
                 "phone": row.get("phone"),
-                "website": row.get("website"),
+                "website": website,
                 "services": row.get("services") or [],
                 "specialties": row.get("specialties") or [],
                 "operating_hours": row.get("operating_hours"),
