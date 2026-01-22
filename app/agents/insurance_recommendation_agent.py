@@ -377,44 +377,76 @@ def fetch_candidate_plans(constraints: Dict[str, Any]) -> Tuple[List[Dict[str, A
     - monthly_premium_min <= budget_max (if provided)
     - required coverage booleans
     - plan_type (case-insensitive equality)
+    
+    Note: Age filtering is partially done here and completed in Python-side (_age_ok)
+    because Supabase doesn't support complex AND/OR combinations.
     """
     try:
         sb = get_supabase_client()
         query = sb.table("Insurance Plans").select("*").eq("is_active", True)
+        
         age = constraints.get("age")
         if age is not None:
-            # Single OR clause combining both bound checks to avoid chaining errors.
-            # (min_age IS NULL OR min_age <= age) AND (max_age IS NULL OR max_age >= age)
-            query = query.or_(f"min_age.is.null,min_age.lte.{age},max_age.is.null,max_age.gte.{age}")
+            # Filter out plans where min_age > age (user is too young)
+            # We'll handle max_age in Python because Supabase OR can't express both bounds properly
+            query = query.or_(f"min_age.is.null,min_age.lte.{age}")
+            
         budget = constraints.get("budget_max")
         if budget is not None:
-            # Allow null premium lower bound
+            # Only include plans where premium is within budget (or NULL if price not set)
             query = query.or_(f"monthly_premium_min.is.null,monthly_premium_min.lte.{budget}")
+            
         plan_type = constraints.get("plan_type")
         if plan_type:
             # Partial match to allow plan type variants (safe improvement)
             query = query.ilike("plan_type", f"%{plan_type}%")
 
+        # Apply required coverage filters (these are AND conditions)
         for cov_key, cov_val in (constraints.get("required_coverages") or {}).items():
             if cov_val:
                 query = query.eq(cov_key, True)
 
         resp = query.execute()
-        return resp.data or [], None
+        plans = resp.data or []
+        
+        # Log for debugging
+        logger.info(
+            f"Fetched {len(plans)} candidate plans from Supabase "
+            f"(age={age}, budget={budget}, plan_type={plan_type}, "
+            f"required_coverages={list((constraints.get('required_coverages') or {}).keys())})"
+        )
+        
+        return plans, None
     except Exception as exc:
+        logger.error(f"Supabase insurance query failed: {exc}", exc_info=True)
         return [], f"Supabase insurance query failed: {exc}"
 
 
 # Python-side age check because Supabase OR cannot express both bounds reliably.
 def _age_ok(plan: Dict[str, Any], age: Optional[int]) -> bool:
+    """
+    Strict age validation: user age must be within [min_age, max_age].
+    - If min_age is set and age < min_age → reject (too young)
+    - If max_age is set and age > max_age → reject (too old)
+    - If both are NULL → accept (no age restrictions)
+    """
     if age is None:
         return True
+    
+    plan_name = plan.get("plan_name", "Unknown")
     min_age = plan.get("min_age")
     max_age = plan.get("max_age")
+    
+    # User is too young for this plan
     if min_age is not None and age < min_age:
+        logger.debug(f"Filtering out '{plan_name}': age {age} < min_age {min_age}")
         return False
+    
+    # User is too old for this plan
     if max_age is not None and age > max_age:
+        logger.debug(f"Filtering out '{plan_name}': age {age} > max_age {max_age}")
         return False
+    
     return True
 
 
@@ -510,25 +542,37 @@ def evaluate_plan_conditions(
     Evaluate condition fit for a plan.
     Returns (fit_label, warnings)
     fit_label: good | partial | reject
+    
+    Note: If no user_conditions provided, all plans get "good" fit.
+    This is intentional - differentiation comes from premium/benefits ranking.
     """
     covered = _normalize_list_field(plan.get("covered_conditions"))
     excluded = _normalize_list_field(plan.get("excluded_conditions"))
+    
     if not user_conditions:
-        return "good", []  # No condition constraints provided
+        # No specific medical conditions to check
+        # All plans are considered "good" from a condition perspective
+        # Differentiation will come from premium, coverage, and benefits
+        return "good", []
 
     warnings: List[str] = []
     has_unclear = False
+    
     for cond in user_conditions:
         status = _classify_condition_fit(llm, cond, covered, excluded)
+        
         if status == "excluded":
             warnings.append(f"{cond} is excluded by this plan.")
             return "reject", warnings
+        
         if status == "unclear":
             # Return partial status - caller will handle follow-up logic if needed
             has_unclear = True
             warnings.append(f"Coverage for {cond} is unclear based on plan data.")
+    
     if has_unclear:
         return "partial", warnings
+    
     return "good", warnings
 
 
@@ -546,10 +590,20 @@ def build_explanation(
     """
     # Deterministic template fallback
     base = f"{plan.get('plan_name') or 'This plan'} from {plan.get('provider_name', 'the provider')}."
-    premium = plan.get("monthly_premium_min")
     expl_parts = [base]
+    
+    # Handle premium (may be None for some plans)
+    premium = plan.get("monthly_premium_min")
     if premium is not None:
-        expl_parts.append(f"Estimated monthly premium starts around {premium}.")
+        expl_parts.append(f"Estimated monthly premium starts around RM{premium}.")
+    else:
+        # Premium not available - mention annual limit or other benefits
+        annual_limit = plan.get("annual_limit")
+        if annual_limit:
+            expl_parts.append(f"Annual coverage limit: RM{annual_limit:,}.")
+        else:
+            expl_parts.append("Contact provider for premium details.")
+    
     if user_conditions:
         expl_parts.append(f"Fit assessment: {fit} for your conditions ({', '.join(user_conditions)}).")
     if warnings:
@@ -627,10 +681,16 @@ def insurance_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
             return state
 
     candidates, err = fetch_candidate_plans(parsed)
+    logger.info(f"Initial candidates from Supabase: {len(candidates)}")
+    
     # Supabase OR cannot cleanly enforce both age bounds; apply definitive age filter here.
     if parsed.get("age") is not None:
+        before_age_filter = len(candidates)
         candidates = [p for p in candidates if _age_ok(p, parsed["age"])]
+        logger.info(f"After age filter: {len(candidates)} plans (filtered out {before_age_filter - len(candidates)})")
+    
     if err:
+        logger.error(f"Error fetching plans: {err}")
         errs = list(state.get("errors", []))
         errs.append(err)
         state["errors"] = errs
@@ -640,6 +700,7 @@ def insurance_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
         return state
 
     if not candidates:
+        logger.warning(f"No candidate plans found for constraints: {parsed}")
         insurance_state["recommended_plans"] = []
         insurance_state["confidence"] = "low"
         state["insurance"] = insurance_state
@@ -649,16 +710,31 @@ def insurance_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
     llm = _build_llm(settings)
     evaluated: List[Tuple[str, Dict[str, Any]]] = []  # (fit_label, plan)
 
+    user_conditions = parsed.get("user_conditions") or []
+    logger.info(f"Evaluating {len(candidates)} plans against conditions: {user_conditions}")
+    
     for plan in candidates:
-        fit, warnings = evaluate_plan_conditions(llm, plan, parsed.get("user_conditions") or [])
+        plan_name = plan.get("plan_name", "Unknown")
+        fit, warnings = evaluate_plan_conditions(llm, plan, user_conditions)
+        
         if fit == "reject":
+            logger.info(f"Plan '{plan_name}' rejected due to excluded conditions")
             continue
+        
+        logger.debug(
+            f"Plan '{plan_name}': fit={fit}, premium={plan.get('monthly_premium_min')}, "
+            f"annual_limit={plan.get('annual_limit')}, warnings={warnings}"
+        )
+        
         plan_copy = dict(plan)
         plan_copy["_fit_label"] = fit
         plan_copy["_warnings"] = warnings
         evaluated.append((fit, plan_copy))
 
+    logger.info(f"After condition evaluation: {len(evaluated)} plans passed")
+    
     if not evaluated:
+        logger.warning("No plans passed condition evaluation")
         insurance_state["recommended_plans"] = []
         insurance_state["confidence"] = "low"
         state["insurance"] = insurance_state
@@ -668,15 +744,39 @@ def insurance_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
     def rank_key(item: Tuple[str, Dict[str, Any]]):
         fit_label, plan = item
         fit_score = 0 if fit_label == "good" else 1
-        premium = plan.get("monthly_premium_min") or float("inf")
-        annual_limit = -(plan.get("annual_limit") or 0)  # negative for descending
-        deductible = plan.get("deductible") or 0
-        return (fit_score, premium, annual_limit, deductible)
+        
+        # Handle NULL premiums: treat as medium-high value (not lowest, not highest)
+        # This allows plans with actual prices to rank by price,
+        # while plans without prices still appear (sorted by benefits)
+        premium = plan.get("monthly_premium_min")
+        if premium is None:
+            # NULL premiums sort after priced plans but still appear
+            # Use 500 as "unknown price" marker (between budget and premium plans)
+            premium_sort = (1, 500)  # (has_null=1, assumed_value=500)
+        else:
+            premium_sort = (0, premium)  # (has_null=0, actual_price)
+        
+        annual_limit = -(plan.get("annual_limit") or 0)  # negative for descending (higher is better)
+        deductible = plan.get("deductible") or 0  # ascending (lower is better)
+        
+        return (fit_score, premium_sort, annual_limit, deductible)
 
     evaluated.sort(key=rank_key)
+    
+    # Log ranking details (show diversity of recommendations)
+    logger.info(f"Plan ranking details (top 10 of {len(evaluated)}):")
+    for idx, (fit_label, plan) in enumerate(evaluated[:10], 1):
+        premium = plan.get('monthly_premium_min')
+        premium_str = f"RM{premium}/mo" if premium else "Price TBD"
+        logger.info(
+            f"  {idx}. {plan.get('plan_name')} ({plan.get('provider_name')}): "
+            f"fit={fit_label}, premium={premium_str}, "
+            f"annual_limit=RM{plan.get('annual_limit') or 0}, "
+            f"deductible=RM{plan.get('deductible') or 0}"
+        )
 
     recommended = []
-    for fit_label, plan in evaluated[:5]:  # cap list to keep response concise
+    for fit_label, plan in evaluated[:3]:  # cap list to keep response concise
         summary = build_explanation(llm, plan, fit_label, parsed.get("user_conditions") or [], plan.get("_warnings", []))
         rec = {
             "provider_name": plan.get("provider_name"),
@@ -706,6 +806,13 @@ def insurance_recommendation_agent(state: Dict[str, Any]) -> Dict[str, Any]:
     confidence = "high" if any(r["fit"] == "good" for r in recommended) else "medium"
     insurance_state["recommended_plans"] = recommended
     insurance_state["confidence"] = confidence
+    
+    # Log final recommendations
+    logger.info(
+        f"Returning {len(recommended)} insurance recommendations with {confidence} confidence. "
+        f"Top plan: {recommended[0].get('plan_name') if recommended else 'None'}"
+    )
+    
     # Clear clarification flags on successful completion
     insurance_state.pop("needs_clarification", None)
     insurance_state.pop("clarification_type", None)
