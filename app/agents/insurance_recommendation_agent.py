@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+from pydantic import BaseModel, Field
 
 from app.agents.planner import _build_llm
 from app.core.config import get_settings
@@ -13,6 +14,54 @@ from app.tools.memory import hydrate_state_from_long_term_memory, upsert_long_te
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+# ---------- Pydantic Schema for LLM Extraction ----------
+
+class RequiredCoverages(BaseModel):
+    """Coverage flags that user explicitly mentioned."""
+    outpatient_covered: Optional[bool] = None
+    maternity_covered: Optional[bool] = None
+    mental_health_covered: Optional[bool] = None
+    dental_covered: Optional[bool] = None
+    optical_covered: Optional[bool] = None
+
+
+class InsuranceIntentSchema(BaseModel):
+    """Structured schema for LLM to extract insurance preferences.
+    
+    CRITICAL: Only extract information explicitly stated in the user input.
+    Use None for fields that are not mentioned. DO NOT guess or infer values.
+    """
+    age: Optional[int] = Field(
+        None,
+        ge=1,
+        le=119,
+        description="User's age in years. Only set if explicitly mentioned (e.g., 'I am 45', 'age 30'). Use None if not stated."
+    )
+    budget_max: Optional[float] = Field(
+        None,
+        ge=0,
+        le=100000,
+        description="Maximum monthly budget for insurance premium. Only set if explicitly mentioned with currency or 'monthly' context. Use None if not stated."
+    )
+    user_conditions: List[str] = Field(
+        default_factory=list,
+        description="List of medical conditions explicitly mentioned (e.g., 'diabetes', 'high blood pressure', 'pregnancy'). Empty list if none mentioned."
+    )
+    required_coverages: RequiredCoverages = Field(
+        default_factory=RequiredCoverages,
+        description="Coverage types explicitly requested by user. Set to true only if user mentions needing that coverage."
+    )
+    plan_type: Optional[str] = Field(
+        None,
+        description="Type of insurance plan requested: 'Medical', 'Life', or None if not specified."
+    )
+    extraction_confidence: str = Field(
+        "medium",
+        description="Confidence in extraction quality: 'high' (all fields clearly stated), 'medium' (some ambiguity), 'low' (input unclear or incomplete)."
+    )
+
 
 
 # ---------- Parsing helpers (deterministic, no LLM) ----------
@@ -97,46 +146,224 @@ def _extract_conditions(text: str) -> List[str]:
     return uniq[:5]
 
 
+# ---------- LLM-based Intent Extraction with Validation ----------
+
+def _parse_intent_with_llm(
+    llm: BaseChatModel,
+    user_input: str,
+    existing_state: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    Use LLM to extract structured insurance constraints from natural language.
+    Applies multi-layer validation to prevent hallucinations and extraction errors.
+    """
+    system_prompt = """You are extracting insurance requirements from user messages.
+
+CRITICAL RULES:
+1. Only extract information EXPLICITLY stated in the user input
+2. Use null/None for any field not clearly mentioned
+3. DO NOT guess, infer, or make up values
+4. Set extraction_confidence based on clarity:
+   - "high": All extracted fields are clearly stated
+   - "medium": Some ambiguity or partial information
+   - "low": Input is unclear, incomplete, or off-topic
+
+Examples:
+- "I'm 35 and need insurance" → age: 35, confidence: medium (no budget mentioned)
+- "I'm in my mid-40s, budget around $300" → age: 45, budget_max: 300, confidence: high
+- "I'm pregnant" → maternity_covered: true, user_conditions: ["pregnancy"], confidence: high
+- "I live at 123 Main St" → age: null, confidence: low (address number, not age)
+
+Return JSON following InsuranceIntentSchema."""
+
+    user_message = f"User input: {user_input}"
+    
+    messages = [
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_message),
+    ]
+    
+    try:
+        # Use structured output if supported (Gemini/GPT-4 with function calling)
+        response = llm.invoke(
+            messages,
+            config={
+                "run_name": "InsuranceIntentExtraction",
+                "tags": [
+                    "agent:InsuranceAdvisorAgent",
+                    "route:insurance",
+                    "component:intent_parsing",
+                    "capability:structured_extraction"
+                ],
+                "metadata": {
+                    "input_length": len(user_input),
+                    "has_existing_state": bool(existing_state)
+                }
+            }
+        )
+        
+        # Parse JSON from response
+        content = response.content if isinstance(response.content, str) else json.dumps(response.content)
+        
+        # Try to find JSON object in response
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if not json_match:
+            logger.warning(f"LLM response did not contain valid JSON: {content[:200]}")
+            return {"extraction_confidence": "low"}
+        
+        llm_data = json.loads(json_match.group(0))
+        
+        # Validate against schema (will raise ValidationError if invalid)
+        validated = InsuranceIntentSchema(**llm_data)
+        
+        # Convert to dict
+        extracted = validated.model_dump()
+        
+        # Apply validation safeguards
+        return _validate_extraction(extracted, user_input)
+        
+    except Exception as exc:
+        logger.error(f"LLM intent extraction failed: {exc}", exc_info=True)
+        return {"extraction_confidence": "low"}
+
+
+def _validate_extraction(llm_result: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+    """
+    Apply multi-layer validation to LLM extraction results.
+    
+    Layers:
+    1. Range validation (age, budget sanity checks)
+    2. Cross-validation with regex patterns
+    3. Confidence-based filtering for critical fields
+    """
+    validated = dict(llm_result)
+    
+    # Layer 1: Range Validation
+    if validated.get("age") is not None:
+        age = validated["age"]
+        if not (1 <= age <= 119):
+            logger.warning(f"LLM extracted invalid age: {age} - discarding")
+            validated["age"] = None
+    
+    if validated.get("budget_max") is not None:
+        budget = validated["budget_max"]
+        if budget < 0 or budget > 100000:
+            logger.warning(f"LLM extracted invalid budget: {budget} - discarding")
+            validated["budget_max"] = None
+    
+    # Layer 2: Cross-validation with regex patterns (prefer regex for exact matches)
+    regex_age = _extract_age(user_input)
+    llm_age = validated.get("age")
+    
+    if regex_age and llm_age:
+        if regex_age != llm_age:
+            logger.warning(
+                f"Age mismatch - LLM: {llm_age}, Regex: {regex_age}. "
+                f"Preferring regex (more deterministic)"
+            )
+            validated["age"] = regex_age
+        else:
+            logger.info(f"Age {llm_age} validated by both LLM and regex")
+    elif regex_age and not llm_age:
+        # Regex found age but LLM didn't - trust regex
+        logger.info(f"Using regex-extracted age {regex_age} (LLM missed it)")
+        validated["age"] = regex_age
+    
+    regex_budget = _extract_budget(user_input)
+    llm_budget = validated.get("budget_max")
+    
+    if regex_budget and llm_budget:
+        # Both found budget - check for major discrepancies
+        if abs(regex_budget - llm_budget) > 50:  # Allow small rounding differences
+            logger.warning(
+                f"Budget mismatch - LLM: {llm_budget}, Regex: {regex_budget}. "
+                f"Preferring regex"
+            )
+            validated["budget_max"] = regex_budget
+    elif regex_budget and not llm_budget:
+        logger.info(f"Using regex-extracted budget {regex_budget}")
+        validated["budget_max"] = regex_budget
+    
+    # Layer 3: Confidence-based filtering
+    # For low confidence, discard critical fields (age/budget) to force clarification
+    if validated.get("extraction_confidence") == "low":
+        logger.info("Low confidence extraction - clearing age and budget to trigger clarification")
+        validated["age"] = None
+        validated["budget_max"] = None
+    
+    # Flatten required_coverages for compatibility
+    coverages = validated.get("required_coverages", {})
+    if isinstance(coverages, dict):
+        # Filter out None values
+        validated["required_coverages"] = {k: v for k, v in coverages.items() if v is not None}
+    
+    return validated
+
+
 def parse_insurance_intent(state: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Deterministic intent/constraint extraction (no LLM).
-    Prefers structured fields already in state['insurance'] and falls back to regex parsing of user_input.
+    Hybrid intent extraction: LLM-based with regex validation and state merging.
+    
+    Flow:
+    1. Use LLM to extract intent from user_input (handles natural language)
+    2. Merge with existing state fields (explicit state takes priority)
+    3. Apply validation safeguards
+    4. Return enriched constraints with confidence scoring
     """
     insurance = state.get("insurance") or {}
     text = (state.get("user_input") or "").strip()
-
-    age = insurance.get("age") or _extract_age(text)
-    budget = insurance.get("budget_max") or _extract_budget(text)
-
-    coverages = insurance.get("required_coverages") or {}
-    # Simple keyword toggles
-    lower_text = text.lower()
-    keyword_map = {
-        "outpatient_covered": ["outpatient", "clinic visits"],
-        "maternity_covered": ["maternity", "pregnancy"],
-        "mental_health_covered": ["mental health", "psych", "depression", "anxiety"],
-        "dental_covered": ["dental", "teeth"],
-        "optical_covered": ["optical", "vision", "glasses"],
-    }
-    for key, kws in keyword_map.items():
-        if key not in coverages:
-            coverages[key] = any(kw in lower_text for kw in kws)
-
-    plan_type = insurance.get("plan_type")
-    if not plan_type:
-        if "life" in lower_text:
-            plan_type = "Life"
-        elif "medical" in lower_text or "health" in lower_text:
-            plan_type = "Medical"
-
-    user_conditions = insurance.get("user_conditions") or _extract_conditions(text)
-
+    
+    # Early return if no new input to parse
+    if not text:
+        return {
+            "age": insurance.get("age"),
+            "budget_max": insurance.get("budget_max"),
+            "required_coverages": insurance.get("required_coverages", {}),
+            "plan_type": insurance.get("plan_type"),
+            "user_conditions": insurance.get("user_conditions", []),
+            "extraction_confidence": "medium"
+        }
+    
+    # Use LLM-based extraction for natural language understanding
+    settings = get_settings()
+    llm = _build_llm(settings)
+    
+    logger.info(f"Parsing insurance intent from user input: {text[:100]}...")
+    llm_extracted = _parse_intent_with_llm(llm, text, insurance)
+    
+    # Merge with existing state (explicit state fields take priority over extracted)
+    age = insurance.get("age") or llm_extracted.get("age")
+    budget_max = insurance.get("budget_max") or llm_extracted.get("budget_max")
+    plan_type = insurance.get("plan_type") or llm_extracted.get("plan_type")
+    
+    # Merge conditions (combine existing + newly extracted, dedupe)
+    existing_conditions = insurance.get("user_conditions") or []
+    extracted_conditions = llm_extracted.get("user_conditions") or []
+    all_conditions = existing_conditions + extracted_conditions
+    user_conditions = list(dict.fromkeys(all_conditions))  # Dedupe preserving order
+    
+    # Merge coverages (OR logic - if either source says true, it's required)
+    existing_coverages = insurance.get("required_coverages") or {}
+    extracted_coverages = llm_extracted.get("required_coverages") or {}
+    required_coverages = {}
+    all_coverage_keys = set(existing_coverages.keys()) | set(extracted_coverages.keys())
+    for key in all_coverage_keys:
+        required_coverages[key] = existing_coverages.get(key, False) or extracted_coverages.get(key, False)
+    
+    extraction_confidence = llm_extracted.get("extraction_confidence", "medium")
+    
+    logger.info(
+        f"Parsed intent - Age: {age}, Budget: {budget_max}, "
+        f"Conditions: {user_conditions}, Confidence: {extraction_confidence}"
+    )
+    
     return {
         "age": age,
-        "budget_max": budget,
-        "required_coverages": {k: v for k, v in coverages.items() if v},
+        "budget_max": budget_max,
+        "required_coverages": {k: v for k, v in required_coverages.items() if v},
         "plan_type": plan_type,
         "user_conditions": user_conditions,
+        "extraction_confidence": extraction_confidence,
     }
 
 
