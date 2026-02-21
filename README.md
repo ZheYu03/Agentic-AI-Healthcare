@@ -6,28 +6,39 @@ A full-stack, multi-agent AI healthcare assistant that helps users triage sympto
 
 ## System Architecture
 
-```
-User (Next.js Frontend)
-        │
-        ▼
-FastAPI Backend  (/chat  or  /chat/stream SSE)
-        │
-        ▼
-   LLM Planner  ──► Generates intent + agent execution sequence
-        │
-        ▼
-LangGraph Orchestrator
-        │
-  ┌─────┼──────────────────────────┐
-  ▼     ▼            ▼             ▼
-Symptom  Clinic   Insurance   Medical
-Triage   Rec.     Advisor     Q&A
-Agent    Agent    Agent       Agent
-        │
-        ▼
- Supabase (Patient Profile Memory + Encounter Memory)
- Pinecone (Medical Knowledge Vector Store)
- LangSmith (Tracing & Observability)
+```mermaid
+flowchart TD
+    User["🖥️ User\n(Next.js Frontend — Vercel)"]
+    API["⚡ FastAPI Backend\n/chat · /chat/stream SSE"]
+    Planner["🧠 LLM Planner\nGemini — intent + agent sequence"]
+    Orch["🔀 LangGraph Orchestrator\nDispatcher · Pause/Resume support"]
+
+    Triage["🩺 SymptomTriageAgent\nTriage level · EHR record · Follow-up questions"]
+    Clinic["🏥 ClinicRecommendationAgent\nNearby clinics · Distance · Hours · Maps links"]
+    Insurance["🛡️ InsuranceAdvisorAgent\nPlan matching · Coverage · Premiums"]
+    QnA["💬 MedicalQnAAgent\nRAG over MedQuAD · Gemini answer generation"]
+
+    Supabase["🗄️ Supabase\nPatient Profile Memory · Encounter Memory\nEncounters · Messages · Insurance Plans"]
+    Pinecone["📌 Pinecone\nMedQuAD Vector Index\n(medquad-gemini)"]
+    LangSmith["🔍 LangSmith\nTracing & Observability"]
+
+    User -->|"HTTPS"| API
+    API -->|"user input"| Planner
+    Planner -->|"execution plan"| Orch
+
+    Orch --> Triage
+    Orch --> Clinic
+    Orch --> Insurance
+    Orch --> QnA
+
+    Triage <-->|"read/write"| Supabase
+    Insurance <-->|"read/write"| Supabase
+    QnA -->|"vector search"| Pinecone
+    Clinic -->|"geocoding / clinic lookup"| Supabase
+
+    Orch -->|"SSE stream"| User
+    Planner -.->|"traces"| LangSmith
+    Orch -.->|"traces"| LangSmith
 ```
 
 ### How It Works
